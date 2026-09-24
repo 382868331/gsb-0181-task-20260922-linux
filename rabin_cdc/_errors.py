@@ -11,6 +11,7 @@ __all__ = [
     "CDCError",
     "ConfigurationError",
     "InvalidBatchTypeError",
+    "InvalidEditError",
     "InputTooLargeError",
     "StreamFinishedError",
 ]
@@ -26,6 +27,10 @@ class ConfigurationError(CDCError, ValueError):
 
 class InvalidBatchTypeError(CDCError, TypeError):
     """A batch handed to ``add`` / ``split_stream`` is not bytes-like."""
+
+
+class InvalidEditError(CDCError, ValueError):
+    """A replacement range (``start``/``end``) is illegal or out of bounds."""
 
 
 class InputTooLargeError(CDCError, ValueError):

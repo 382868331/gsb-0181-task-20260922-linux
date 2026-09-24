@@ -12,6 +12,7 @@ from ._errors import (
     ConfigurationError,
     InputTooLargeError,
     InvalidBatchTypeError,
+    InvalidEditError,
     StreamFinishedError,
 )
 from .chunker import (
@@ -29,6 +30,7 @@ from .chunker import (
     Chunker,
     split_stream,
 )
+from .replace import KeptBlock, ReplaceResult, replace_region
 from ._fingerprint import POLY, WINDOW_SIZE
 
 __all__ = [
@@ -41,6 +43,8 @@ __all__ = [
     "FINGERPRINT_BITS",
     "InputTooLargeError",
     "InvalidBatchTypeError",
+    "InvalidEditError",
+    "KeptBlock",
     "MAX_BLOCK_BYTES",
     "MAX_TOTAL_BYTES",
     "MIN_BLOCK_BYTES",
@@ -48,8 +52,10 @@ __all__ = [
     "REASON_CONTENT",
     "REASON_MAX",
     "REASON_TAIL",
+    "ReplaceResult",
     "StreamFinishedError",
     "WINDOW_BYTES",
     "WINDOW_SIZE",
+    "replace_region",
     "split_stream",
 ]

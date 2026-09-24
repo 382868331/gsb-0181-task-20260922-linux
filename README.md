@@ -12,10 +12,11 @@
 ## 准确命令
 
 ```bash
-# 必要测试（含独立慢速长除法参考对拍）
+# 必要测试（含独立慢速长除法参考对拍、替换映射 DP 对拍）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：真实计算约 0.2 秒（远低于 8 秒预算），打印正常结果与实际触发的拒绝
+# 固定输入演示：真实计算约 1 秒（远低于 90 秒预算），打印正常结果、
+# 首/尾与跨边界编辑的映射、以及实际触发的拒绝
 python demo.py
 ```
 
@@ -52,8 +53,10 @@ f' = SHIFT[hi(f)] XOR BYTE[lo(f)] XOR REMOVE[b_out] XOR b_in
 
 ```python
 from rabin_cdc import split_stream, Chunker, Block
+from rabin_cdc import replace_region, ReplaceResult, KeptBlock
 
 blocks: list[Block] = split_stream(chunks)
+result: ReplaceResult = replace_region(obj, start, end, replacement)
 ```
 
 - `split_stream(chunks)`：接收**字节批次的可迭代对象**（`bytes` /
@@ -76,18 +79,65 @@ blocks: list[Block] = split_stream(chunks)
 常量：`MIN_BLOCK_BYTES=64`、`MAX_BLOCK_BYTES=256`、`MAX_TOTAL_BYTES=1<<20`、
 `WINDOW_BYTES=32`、`CUT_MASK=0x3F`、`POLY=0x11021`。
 
+## 大对象中间替换：`replace_region`
+
+```python
+from rabin_cdc import replace_region
+
+result = replace_region(obj, start, end, replacement)
+```
+
+对已存在的对象（**单个 bytes-like 对象**，不是批次的可迭代对象）做一次
+半开区间替换：逻辑上等价于 `obj[:start] + replacement + obj[end:]`
+（`start==end` 为插入，`replacement==b""` 为删除，`end==len(obj)` 改尾部，
+`start==0` 改首部），然后**沿用完全相同的切分规则**对旧对象和新对象各切一次，
+返回 `ReplaceResult`：
+
+| 字段 | 含义 |
+|---|---|
+| `start` / `end` / `replacement` | 回显本次编辑参数（`replacement` 存为 `bytes`） |
+| `old_blocks` / `new_blocks` | 旧/新对象的完整块列表（tuple，绝对区间口径与 `Block` 一致） |
+| `kept` | `KeptBlock(old, new)` 元组序列：旧块按 **SHA-256 内容标识**在新切分中仍然存在 |
+| `replaced` | 内容在新对象中消失的旧块（旧流序） |
+| `added` | 旧对象中不存在的新块（新流序） |
+| `old_size` / `new_size` / `length_delta` | 旧/新对象字节数与差 |
+
+恒等式：`len(kept)+len(replaced)==len(old_blocks)`、
+`len(kept)+len(added)==len(new_blocks)`；每个 `KeptBlock` 满足
+`old.sha256 == new.sha256`、`old.size == new.size`，仅绝对偏移可能变化，
+`offset_shift = new.start - old.start`（编辑点之前的块为 0，恢复对齐之后的
+块统一等于长度差）。
+
+### 稳定标识与相同内容
+
+块的身份是**载荷 SHA-256，与位置无关**：同一内容出现在对象任意位置（含重复
+副本）都是同一标识。存在多个相同副本时，按流序做保序的确定性配对（公共前缀
+优先，其次公共后缀，中间取最早可行匹配），因此重复内容不会错配。本次迭代
+**允许重新扫描整个对象**（旧、新各全量切一次），不做局部重扫优化；映射只报告
+内容的保留/替换/新增关系，不做版本引用计数。
+
+该入口是纯函数：不修改 `obj`（传入 `bytearray` 也不会被改动），所有校验在
+任何拷贝/切分之前完成，非法调用直接报错，不存在半更新状态。编辑后对象同样受
+1 MiB 上限约束（删除导致缩短总是合法）。
+
 ## 错误语义（可定位，不静默纠正）
 
 异常都派生自 `rabin_cdc.CDCError`：
 
 - `InvalidBatchTypeError`（同时是 `TypeError`）：`chunks` 不可迭代、直接传入
   单个 `bytes`、某批次不是 bytes-like、`memoryview` 非一维 `B` 格式。消息带
-  批次下标（如 `batch 1: ...`）。`bool` 不会被当作整数批次接受；`float`
-  （含 NaN/±Infinity）一律拒绝而非隐式转换。
-- `InputTooLargeError`（同时是 `ValueError`）：累计输入会超过 1 MiB。
+  批次下标（如 `batch 1: ...`）。`replace_region` 的 `obj`/`replacement`
+  类型不合法时报 `obj:` / `replacement:` 前缀的同类错误。`bool` 不会被当作
+  整数接受；`float`（含 NaN/±Infinity）一律拒绝而非隐式转换。
+- `InvalidEditError`（同时是 `ValueError`）：`replace_region` 的
+  `start`/`end` 不是非布尔整数、为负数、`end < start`，或
+  `end > len(obj)`（含在空对象上用非零偏移插入）。
+- `InputTooLargeError`（同时是 `ValueError`）：累计输入会超过 1 MiB，或一次
+  替换编辑后的对象会超过 1 MiB。
 - `StreamFinishedError`：`finish()` 后再 `add()`/`finish()`。
 - **有状态操作原子性**：类型与上限检查在消费任何字节之前完成；被拒批次不会
   部分进入内部状态，随后可继续喂入合法批次，结果与从未提交坏批次一致。
+  `replace_region` 是纯函数，非法调用不改变任何输入或外部状态。
 - 本算法核心不存在搜索/求解过程，因此没有“预算耗尽”类错误；测试中的确定性
   小范围枚举若找不到构造值会显式失败，与“证明无解”不做混淆。
 
@@ -117,9 +167,12 @@ blocks: list[Block] = split_stream(chunks)
 - 只实现本题契约的有限数学子集：单一固定模多项式、32 字节窗口、6 位切点、
   [64,256] 区间、1 MiB 上限；**不宣称**兼容任何行业分块标准/指纹规范（如
   rsync、FastCDC 等），也不提供其参数集。
-- 单流上限 1 MiB 是接口边界；超限直接报错，不做磁盘溢出。
+- 单流/单对象上限 1 MiB 是接口边界；超限直接报错，不做磁盘溢出。
 - 非线程安全：一个 `Chunker` 不应被多线程并发 `add`。
-- 内容寻址的“块存储后端/去重库”不在本题范围内，demo 只展示复用比例。
+- 内容寻址的“块存储后端/去重库”不在本题范围内，demo 只展示复用比例与映射。
+- `replace_region` 本次迭代**全量重扫旧、新两个对象**，不做局部重扫、不保证
+  局部复杂度上界；也不维护跨版本的持久引用计数。结果是一次性的快照映射，
+  不保存对象历史版本。
 
 ## 仓库布局
 
@@ -127,6 +180,7 @@ blocks: list[Block] = split_stream(chunks)
 rabin_cdc/
   __init__.py        公开接口导出
   chunker.py         split_stream / Chunker / Block（滚动切分核心）
+  replace.py         replace_region / ReplaceResult / KeptBlock（替换映射）
   _fingerprint.py    GF(2) 余数与三张滚动更新表
   _errors.py         异常类型
 tests/
@@ -135,7 +189,9 @@ tests/
   test_fingerprint.py 指纹/表/滚动与长除一致性
   test_chunker.py    契约、零数据、窗口前缀、任意分批等价、插入一字节恢复、
                      错误语义、原子性、上限、fuzz 对拍
-demo.py              固定输入演示（复用块比例 + 真实拒绝边界）
+  test_replace.py    替换映射：手算零流块、首/尾/跨边界编辑、相同内容稳定
+                     标识、分区恒等式、独立 DP-LCS 对拍、错误与原子性
+demo.py              固定输入演示（复用块比例 + 替换映射 + 真实拒绝边界）
 ```
 
 独立参考 `tests/_slow_reference.py` **不导入** `rabin_cdc`，期望值全部由原始

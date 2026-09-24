@@ -11,20 +11,29 @@ It really computes (no pre-recorded output, no sleep):
    single byte in the middle, chunks again, and reports the *reusable block
    ratio* (blocks addressed by SHA-256 that survive the one-byte edit), plus
    the boundary realignment point.
-2. Triggers two real input-contract rejections (one byte over the 1 MiB
-   limit; a non-bytes batch) and prints the actual raised errors.
+2. Demonstrates ``replace_region``: a middle replacement that returns the
+   explicit kept/replaced/added block mapping (including a cross-boundary
+   edit), head/tail boundary edits, and the stable identity of repeated
+   content.
+3. Triggers real input-contract rejections (one byte over the 1 MiB
+   limit; a non-bytes batch; an out-of-bounds replacement range) and prints
+   the actual raised errors.
 """
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import time
 
 from rabin_cdc import (
     MAX_TOTAL_BYTES,
     Block,
+    CDCError,
     InputTooLargeError,
     InvalidBatchTypeError,
+    InvalidEditError,
+    replace_region,
     split_stream,
 )
 
@@ -117,6 +126,59 @@ def main() -> int:
         )
     print(f"  示例首块 SHA-256  : {original[0].sha256}")
 
+    # --- replace_region: middle edit -> kept/replaced/added mapping ------
+    print("-" * 72)
+    print("中间替换入口 replace_region(obj, start, end, replacement)")
+    boundary = original[len(original) // 2].start
+    rep_start = boundary - 5          # straddles a real chunk boundary
+    rep_end = boundary + 7
+    rep = lcg_bytes(50, SEED ^ 0x55AA)
+    res = replace_region(data, rep_start, rep_end, rep)
+    print(
+        f"  跨边界替换        : [{rep_start},{rep_end}) -> {len(rep)} bytes "
+        f"(边界点 {boundary}, 长度变化 {res.length_delta:+d})"
+    )
+    print(
+        f"  旧块 {len(res.old_blocks)} 个 -> 新块 {len(res.new_blocks)} 个; "
+        f"保留 {len(res.kept)} / 替换 {len(res.replaced)} / 新增 {len(res.added)}"
+    )
+    moved = [k for k in res.kept if k.offset_shift]
+    fixed = [k for k in res.kept if not k.offset_shift]
+    print(
+        f"  保留块中偏移不变  : {len(fixed)} 个; 仅整体平移: {len(moved)} 个 "
+        f"(平移量集合 {sorted({k.offset_shift for k in moved})})"
+    )
+    churned_old = sorted(b.start for b in res.replaced)
+    churned_new = sorted(b.start for b in res.added)
+    print(f"  被替换旧块起点    : {churned_old}")
+    print(f"  新增块起点        : {churned_new}")
+    # Hand-checkable accounting identity on every call.
+    assert len(res.kept) + len(res.replaced) == len(res.old_blocks)
+    assert len(res.kept) + len(res.added) == len(res.new_blocks)
+
+    # Head and tail boundary edits: prefix/suffix behavior.
+    head = replace_region(data, 0, 0, b"\x5A" * 3)
+    far = [k for k in head.kept if k.old.start >= 32 + 256]
+    print(
+        f"  首部插入 3 字节   : 恢复区 {len(far)} 个保留块全部后移 "
+        f"{sorted({k.offset_shift for k in far})[0]} 字节"
+    )
+    tail = replace_region(data, len(data) - 10, len(data), b"zzz")
+    print(
+        f"  尾部替换          : 保留 {len(tail.kept)} / 替换 "
+        f"{len(tail.replaced)} / 新增 {len(tail.added)}, 保留块偏移全为 0: "
+        f"{all(k.offset_shift == 0 for k in tail.kept)}"
+    )
+    # Identical content anywhere shares one stable identity.
+    dup = bytes(64) * 3 + lcg_bytes(900, SEED)
+    dres = replace_region(dup, len(dup), len(dup), b"\x00" * 12)
+    zero_hash = hashlib.sha256(bytes(64)).hexdigest()
+    print(
+        f"  相同内容稳定标识  : 3 个相同的 64 零字节块配对保留 "
+        f"{sum(k.old.sha256 == zero_hash for k in dres.kept)} 个, "
+        f"标识是 SHA-256 而非位置"
+    )
+
     # --- Real contract rejections ----------------------------------------
     print("-" * 72)
     print("接口边界拒绝 (实际触发, 非预录):")
@@ -129,6 +191,27 @@ def main() -> int:
         split_stream(["not-a-bytes-batch"])
     except InvalidBatchTypeError as exc:
         print(f"  [OK] 非法批次类型 -> {type(exc).__name__}: {exc}")
+
+    try:
+        replace_region(b"abc", 1, 9, b"")
+    except InvalidEditError as exc:
+        print(f"  [OK] 替换区间越界 -> {type(exc).__name__}: {exc}")
+
+    try:
+        replace_region(b"\x00" * MAX_TOTAL_BYTES, 0, 0, b"x")
+    except InputTooLargeError as exc:
+        print(f"  [OK] 编辑后超 1 MiB -> {type(exc).__name__}: {exc}")
+
+    # All rejections are one catchable family.
+    for bad in (
+        lambda: replace_region("x", 0, 0, b""),
+        lambda: replace_region(b"x", 0, 1, 1),
+        lambda: replace_region(b"x", True, 1, b""),
+    ):
+        try:
+            bad()
+        except CDCError as exc:
+            print(f"  [OK] 非法参数 -> {type(exc).__name__}: {exc}")
 
     elapsed = time.perf_counter() - started
     print("-" * 72)
