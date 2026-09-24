@@ -10,6 +10,7 @@ from __future__ import annotations
 __all__ = [
     "CDCError",
     "ConfigurationError",
+    "EditValidationError",
     "InvalidBatchTypeError",
     "InputTooLargeError",
     "StreamFinishedError",
@@ -22,6 +23,15 @@ class CDCError(Exception):
 
 class ConfigurationError(CDCError, ValueError):
     """A chunker parameter has an illegal type or range."""
+
+
+class EditValidationError(CDCError, ValueError):
+    """An edit descriptor (offset or payload) is invalid.
+
+    Raised by middle-region replacement entry points when an offset is not a
+    real ``int`` (``bool`` is rejected), is negative, lies outside the
+    object, or describes a backwards/half-open-invalid interval.
+    """
 
 
 class InvalidBatchTypeError(CDCError, TypeError):

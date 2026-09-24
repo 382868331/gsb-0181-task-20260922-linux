@@ -10,6 +10,7 @@ from __future__ import annotations
 from ._errors import (
     CDCError,
     ConfigurationError,
+    EditValidationError,
     InputTooLargeError,
     InvalidBatchTypeError,
     StreamFinishedError,
@@ -29,27 +30,44 @@ from .chunker import (
     Chunker,
     split_stream,
 )
+from .diff import (
+    KEEP,
+    NEW,
+    REPLACE,
+    BlockMapping,
+    ReplacementResult,
+    diff_chunks,
+    replace_region,
+)
 from ._fingerprint import POLY, WINDOW_SIZE
 
 __all__ = [
     "Block",
+    "BlockMapping",
     "BytesLike",
     "CDCError",
     "CUT_MASK",
     "Chunker",
     "ConfigurationError",
+    "EditValidationError",
     "FINGERPRINT_BITS",
     "InputTooLargeError",
     "InvalidBatchTypeError",
+    "KEEP",
     "MAX_BLOCK_BYTES",
     "MAX_TOTAL_BYTES",
     "MIN_BLOCK_BYTES",
+    "NEW",
     "POLY",
     "REASON_CONTENT",
     "REASON_MAX",
     "REASON_TAIL",
+    "REPLACE",
+    "ReplacementResult",
     "StreamFinishedError",
     "WINDOW_BYTES",
     "WINDOW_SIZE",
+    "diff_chunks",
+    "replace_region",
     "split_stream",
 ]
