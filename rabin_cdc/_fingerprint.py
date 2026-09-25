@@ -47,6 +47,7 @@ __all__ = [
     "BYTE_TABLE",
     "REMOVE_TABLE",
     "shift8",
+    "stream_remainder",
 ]
 
 #: Modulus P(x) = x^16 + x^12 + x^5 + 1, bit 16 included for long division.
@@ -121,3 +122,16 @@ REMOVE_TABLE: array = _build_remove_table()
 def shift8(fingerprint: int) -> int:
     """Return ``fingerprint * x^8 mod P`` using the lookup tables."""
     return SHIFT_TABLE[(fingerprint >> 8) & 0xFF] ^ BYTE_TABLE[fingerprint & 0xFF]
+
+
+def stream_remainder(data: bytes) -> int:
+    """Remainder of ``data``'s full polynomial modulo P, computed directly.
+
+    The whole byte string is reduced in one shot by bit-level long
+    division (first byte holds the highest powers, MSB first); the rolling
+    update tables are never consulted.  This is the reference path used to
+    validate exported boundary contexts: a stored fingerprint is trusted
+    only if it equals the remainder recomputed straight from the window
+    bytes.
+    """
+    return _reduce(int.from_bytes(data, "big"))

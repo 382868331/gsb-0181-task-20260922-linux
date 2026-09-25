@@ -20,28 +20,40 @@ Public contract (fixed)
   ``[start, end)``; ``sha256`` is the lowercase hex digest of the block
   payload.
 * At most ``MAX_TOTAL_BYTES`` = 1 MiB may be fed to one stream.
+* :meth:`Chunker.export_context` snapshots the exact boundary state
+  (rolling window, current fingerprint, unclosed block payload, absolute
+  offset) into an immutable :class:`BoundaryContext`;
+  :meth:`Chunker.from_context` resumes a fresh chunker from it, so
+  adjacent segments of one stream can be processed separately and still
+  yield exactly the blocks of a continuous split.  Exporting commits
+  nothing: the tail block is still emitted only by an explicit
+  :meth:`Chunker.finish`.
 
 Invalid input never mutates state: type and size checks for a batch run
-before any of its bytes are consumed.
+before any of its bytes are consumed, and a boundary context is validated
+as a whole before any resumable state is built.
 """
 
 from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, Union
+from typing import Iterable, Iterator, Optional, Tuple, Union
 
 from ._errors import (
     ConfigurationError,
     InputTooLargeError,
     InvalidBatchTypeError,
+    InvalidContextError,
     StreamFinishedError,
 )
 from ._fingerprint import (
     BYTE_TABLE,
+    POLY,
     REMOVE_TABLE,
     SHIFT_TABLE,
     WINDOW_SIZE,
+    stream_remainder,
 )
 
 __all__ = [
@@ -54,7 +66,10 @@ __all__ = [
     "REASON_CONTENT",
     "REASON_MAX",
     "REASON_TAIL",
+    "CONTEXT_FORMAT_VERSION",
+    "PARAMETERS_FINGERPRINT",
     "Block",
+    "BoundaryContext",
     "Chunker",
     "split_stream",
     "BytesLike",
@@ -84,6 +99,25 @@ REASON_TAIL = "tail"
 
 BytesLike = Union[bytes, bytearray, memoryview]
 
+#: Layout version of :class:`BoundaryContext`; bumped on any format change.
+CONTEXT_FORMAT_VERSION = 1
+
+# Canonical encoding of every fixed algorithm parameter.  Any change to
+# the chunking contract changes this string and therefore the fingerprint.
+_PARAMETERS_CANONICAL = (
+    f"rabin-cdc/boundary-context:v{CONTEXT_FORMAT_VERSION}:"
+    f"poly=0x{POLY:05X};window={WINDOW_BYTES};min={MIN_BLOCK_BYTES};"
+    f"max={MAX_BLOCK_BYTES};cut_mask=0x{CUT_MASK:02X};"
+    f"fingerprint_bits={FINGERPRINT_BITS};max_total={MAX_TOTAL_BYTES}"
+)
+
+#: Fingerprint of the fixed algorithm parameters (first 16 hex chars of
+#: the SHA-256 of the canonical parameter string).  A context only resumes
+#: into a library whose parameters match the exporting library exactly.
+PARAMETERS_FINGERPRINT = hashlib.sha256(
+    _PARAMETERS_CANONICAL.encode("ascii")
+).hexdigest()[:16]
+
 
 @dataclass(frozen=True, slots=True)
 class Block:
@@ -103,6 +137,148 @@ class Block:
     size: int
     sha256: str
     reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class BoundaryContext:
+    """Immutable snapshot of a chunker's exact boundary state.
+
+    Produced by :meth:`Chunker.export_context`, consumed by
+    :meth:`Chunker.from_context`.  All fields are value types (``int`` /
+    ``str`` / ``bytes``) and the payload is copied out of the live
+    chunker, so nothing the caller does with this object afterwards can
+    disturb the chunker it came from.
+
+    Attributes:
+        format_version: Layout version; must equal
+            :data:`CONTEXT_FORMAT_VERSION` on resume.
+        parameters: :data:`PARAMETERS_FINGERPRINT` of the exporting
+            library; guards against resuming with different parameters.
+        offset: Absolute stream offset, i.e. bytes consumed so far.
+        window: Current rolling window, oldest byte first;
+            ``len(window) == min(offset, WINDOW_BYTES)``.
+        fingerprint: 16-bit remainder of ``window`` modulo P.
+        pending: Full payload of the not-yet-closed block
+            (``0 <= len(pending) < MAX_BLOCK_BYTES``).  The unclosed
+            block's SHA-256 input is preserved in full -- keeping only
+            the 32-byte window would lose it.
+    """
+
+    format_version: int
+    parameters: str
+    offset: int
+    window: bytes
+    fingerprint: int
+    pending: bytes
+
+
+def _context_bytes(value: object, field: str) -> bytes:
+    """Coerce a context byte field to an immutable, detached ``bytes``."""
+    if isinstance(value, memoryview):
+        if value.format != "B" or value.itemsize != 1 or value.ndim != 1:
+            raise InvalidContextError(
+                f"context.{field}: memoryview must be one-dimensional "
+                f"unsigned bytes (format='B', itemsize=1, ndim=1), got "
+                f"format={value.format!r}, itemsize={value.itemsize}, "
+                f"ndim={value.ndim}"
+            )
+    elif not isinstance(value, (bytes, bytearray)):
+        raise InvalidContextError(
+            f"context.{field}: expected a bytes-like value, got "
+            f"{type(value).__name__}"
+        )
+    return bytes(value)
+
+
+def _validate_context(
+    context: object,
+) -> Tuple[bytes, int, bytes, int]:
+    """Validate a :class:`BoundaryContext` as a whole before any resume.
+
+    Returns ``(window, fingerprint, pending, offset)`` as detached
+    immutable values.  Every inconsistency raises
+    :class:`InvalidContextError`; nothing is mutated on failure.
+    """
+    if not isinstance(context, BoundaryContext):
+        raise InvalidContextError(
+            "expected a BoundaryContext, got "
+            f"{type(context).__name__}"
+        )
+
+    version = context.format_version
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise InvalidContextError(
+            f"context.format_version: expected int, got "
+            f"{type(version).__name__}"
+        )
+    if version != CONTEXT_FORMAT_VERSION:
+        raise InvalidContextError(
+            f"unsupported context format version {version}; this library "
+            f"supports version {CONTEXT_FORMAT_VERSION}"
+        )
+
+    if context.parameters != PARAMETERS_FINGERPRINT:
+        raise InvalidContextError(
+            "parameter fingerprint mismatch: the context was exported by "
+            "a library with different chunking parameters "
+            f"(context has {context.parameters!r}, this library has "
+            f"{PARAMETERS_FINGERPRINT!r})"
+        )
+
+    offset = context.offset
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise InvalidContextError(
+            f"context.offset: expected int, got {type(offset).__name__}"
+        )
+    if not 0 <= offset <= MAX_TOTAL_BYTES:
+        raise InvalidContextError(
+            f"context.offset {offset} is outside "
+            f"[0, {MAX_TOTAL_BYTES}]"
+        )
+
+    fingerprint = context.fingerprint
+    if isinstance(fingerprint, bool) or not isinstance(fingerprint, int):
+        raise InvalidContextError(
+            f"context.fingerprint: expected int, got "
+            f"{type(fingerprint).__name__}"
+        )
+    if not 0 <= fingerprint <= 0xFFFF:
+        raise InvalidContextError(
+            f"context.fingerprint 0x{fingerprint:X} is outside the "
+            f"16-bit range [0x0000, 0xFFFF]"
+        )
+
+    window = _context_bytes(context.window, "window")
+    expected_window = min(offset, WINDOW_SIZE)
+    if len(window) != expected_window:
+        raise InvalidContextError(
+            f"context.window holds {len(window)} bytes but offset "
+            f"{offset} requires exactly {expected_window} "
+            f"(min(offset, {WINDOW_SIZE}))"
+        )
+    # The stored fingerprint is trusted only if it equals the remainder
+    # recomputed straight from the window bytes by direct polynomial
+    # division -- never via the rolling update tables.
+    actual = stream_remainder(window)
+    if actual != fingerprint:
+        raise InvalidContextError(
+            f"context.fingerprint 0x{fingerprint:04X} does not match the "
+            f"window remainder 0x{actual:04X} recomputed by direct "
+            f"polynomial division"
+        )
+
+    pending = _context_bytes(context.pending, "pending")
+    if len(pending) > offset:
+        raise InvalidContextError(
+            f"context.pending holds {len(pending)} bytes, more than the "
+            f"cumulative offset {offset}"
+        )
+    if len(pending) >= MAX_BLOCK_BYTES:
+        raise InvalidContextError(
+            f"context.pending holds {len(pending)} bytes; a block of "
+            f"{MAX_BLOCK_BYTES} bytes would already have been force-cut"
+        )
+    return window, fingerprint, pending, offset
 
 
 def _check_batch(batch: object, index: Optional[int]) -> bytes:
@@ -168,6 +344,62 @@ class Chunker:
     def finished(self) -> bool:
         """Whether :meth:`finish` has been called."""
         return self._finished
+
+    def export_context(self) -> BoundaryContext:
+        """Snapshot the exact boundary state for later resumption.
+
+        The returned :class:`BoundaryContext` is immutable and fully
+        detached from this chunker (the window and the unclosed block
+        payload are copied).  Exporting commits nothing: the rolling
+        window is not reset and the tail block is still emitted only by
+        an explicit :meth:`finish`.  This chunker may keep being fed
+        after the export; both it and any chunker resumed from the
+        context proceed independently from the same state.
+        """
+        if self._finished:
+            raise StreamFinishedError(
+                "cannot export_context() after finish(); the stream is "
+                "closed"
+            )
+        if self._filled < WINDOW_SIZE:
+            window = bytes(self._ring[: self._filled])
+        else:
+            # Oldest byte sits at _head while the ring is full.
+            window = bytes(self._ring[self._head :] + self._ring[: self._head])
+        return BoundaryContext(
+            format_version=CONTEXT_FORMAT_VERSION,
+            parameters=PARAMETERS_FINGERPRINT,
+            offset=self._total,
+            window=window,
+            fingerprint=self._fp,
+            pending=bytes(self._payload),
+        )
+
+    @classmethod
+    def from_context(cls, context: BoundaryContext) -> "Chunker":
+        """Build a chunker that continues exactly where an export stopped.
+
+        The context is validated as a whole (format version, parameter
+        fingerprint, offset/window/pending consistency, and the window
+        remainder recomputed by direct polynomial division) before any
+        state is built; any mismatch raises :class:`InvalidContextError`.
+        The resumed chunker resplits nothing: feeding it the remaining
+        segments and calling :meth:`finish` yields exactly the blocks a
+        continuous run over the concatenated stream would produce.
+        """
+        window, fingerprint, pending, offset = _validate_context(context)
+        chunker = cls()
+        filled = len(window)
+        # Rebuild the ring so the oldest byte sits at _head, matching the
+        # invariant of a continuously fed chunker.
+        chunker._ring[:filled] = window
+        chunker._head = filled & (WINDOW_SIZE - 1)
+        chunker._filled = filled
+        chunker._fp = fingerprint
+        chunker._payload = bytearray(pending)
+        chunker._block_start = offset - len(pending)
+        chunker._total = offset
+        return chunker
 
     def add(self, batch: BytesLike) -> list[Block]:
         """Consume one bytes-like batch and return any completed blocks.

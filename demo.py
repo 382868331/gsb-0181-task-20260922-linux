@@ -11,20 +11,29 @@ It really computes (no pre-recorded output, no sleep):
    single byte in the middle, chunks again, and reports the *reusable block
    ratio* (blocks addressed by SHA-256 that survive the one-byte edit), plus
    the boundary realignment point.
-2. Triggers two real input-contract rejections (one byte over the 1 MiB
+2. Splits a stream into two adjacent segments via an exported
+   ``BoundaryContext`` at three named cuts (right after a forced max cut,
+   one byte short of the minimum block, empty tail segment) and checks the
+   blocks against a continuous split, then shows a tampered context being
+   rejected.
+3. Triggers two real input-contract rejections (one byte over the 1 MiB
    limit; a non-bytes batch) and prints the actual raised errors.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 import time
 
 from rabin_cdc import (
     MAX_TOTAL_BYTES,
+    MIN_BLOCK_BYTES,
     Block,
+    Chunker,
     InputTooLargeError,
     InvalidBatchTypeError,
+    InvalidContextError,
     split_stream,
 )
 
@@ -53,6 +62,39 @@ def reason_counts(blocks: list[Block]) -> dict[str, int]:
 
 def boundaries(blocks: list[Block]) -> list[int]:
     return [b.end for b in blocks]
+
+
+def mixed_stream(length: int, seed: int) -> bytes:
+    """Constant runs (force max cuts) interleaved with LCG data."""
+    rng = lcg_bytes(length, seed)
+    parts: list[bytes] = []
+    pos = 0
+    rpos = 0
+    value = 0x01
+    while pos < length:
+        run = min(700, length - pos)
+        parts.append(bytes([value]) * run)
+        pos += run
+        if pos < length:
+            take = min(333, length - pos)
+            parts.append(rng[rpos : rpos + take])
+            rpos += take
+            pos += take
+        value = 0x55 if value == 0x01 else 0x01
+    return b"".join(parts)
+
+
+def split_two_segments(data: bytes, cut: int):
+    """Process [0, cut) and [cut, len) separately via a BoundaryContext."""
+    left = Chunker()
+    blocks = list(left.add(data[:cut]))
+    context = left.export_context()  # snapshot; left could keep running
+    right = Chunker.from_context(context)  # e.g. another process/machine
+    blocks.extend(right.add(data[cut:]))
+    tail = right.finish()
+    if tail is not None:
+        blocks.append(tail)
+    return blocks, context
 
 
 def main() -> int:
@@ -116,6 +158,36 @@ def main() -> int:
             f"{twin.start - block.start} 字节, 大小/SHA-256 不变"
         )
     print(f"  示例首块 SHA-256  : {original[0].sha256}")
+
+    # --- Segmented processing via an exported boundary context -----------
+    print("-" * 72)
+    print("相邻区段分段处理 (BoundaryContext 导出 / 恢复):")
+    seg_data = mixed_stream(3000, seed=7)
+    seg_blocks = split_stream([seg_data])
+    first_max = next(b for b in seg_blocks if b.reason == "max")
+    cases = [
+        ("刚强切(max)之后", first_max.end),
+        ("距最小块差一字节", first_max.end + MIN_BLOCK_BYTES - 1),
+        ("空尾段(流末尾)", len(seg_data)),
+    ]
+    for label, cut in cases:
+        got, context = split_two_segments(seg_data, cut)
+        same = got == seg_blocks
+        print(
+            f"  [{'OK' if same else 'FAIL'}] {label:<14} cut={cut:>5} "
+            f"pending={len(context.pending):>3}B window={len(context.window)}B "
+            f"-> {len(got)} 块与连续切分{'一致' if same else '不一致!'}"
+        )
+        if not same:
+            return 1
+    # A tampered context is rejected as a whole before any resume.
+    _, good = split_two_segments(seg_data, first_max.end)
+    forged = dataclasses.replace(good, fingerprint=good.fingerprint ^ 0x0001)
+    try:
+        Chunker.from_context(forged)
+    except InvalidContextError as exc:
+        print(f"  [OK] 篡改指纹的上下文 -> {type(exc).__name__}: {exc}")
+    print(f"  上下文参数指纹    : {good.parameters} (格式版本 v{good.format_version})")
 
     # --- Real contract rejections ----------------------------------------
     print("-" * 72)

@@ -11,6 +11,7 @@ __all__ = [
     "CDCError",
     "ConfigurationError",
     "InvalidBatchTypeError",
+    "InvalidContextError",
     "InputTooLargeError",
     "StreamFinishedError",
 ]
@@ -30,6 +31,15 @@ class InvalidBatchTypeError(CDCError, TypeError):
 
 class InputTooLargeError(CDCError, ValueError):
     """The cumulative stream would exceed :data:`MAX_TOTAL_BYTES`."""
+
+
+class InvalidContextError(CDCError, ValueError):
+    """An exported boundary context failed validation on resume.
+
+    Raised for a wrong format version, a parameter-fingerprint mismatch,
+    or any inconsistency between the cumulative offset, the rolling
+    window, the stored fingerprint and the unclosed block payload.
+    """
 
 
 class StreamFinishedError(CDCError, ValueError):
