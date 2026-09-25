@@ -10,6 +10,7 @@ from __future__ import annotations
 __all__ = [
     "CDCError",
     "ConfigurationError",
+    "ContextError",
     "InvalidBatchTypeError",
     "InputTooLargeError",
     "StreamFinishedError",
@@ -34,3 +35,7 @@ class InputTooLargeError(CDCError, ValueError):
 
 class StreamFinishedError(CDCError, ValueError):
     """The stream was used after ``finish()`` ended it."""
+
+
+class ContextError(CDCError, ValueError):
+    """A boundary context snapshot is malformed or internally inconsistent."""

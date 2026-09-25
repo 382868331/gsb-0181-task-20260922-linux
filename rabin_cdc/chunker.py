@@ -148,6 +148,9 @@ class Chunker:
     )
 
     def __init__(self) -> None:
+        self._reset()
+
+    def _reset(self) -> None:
         # Circular 32-byte window (oldest byte sits at _head while full).
         self._ring = bytearray(WINDOW_SIZE)
         self._head = 0
@@ -158,6 +161,53 @@ class Chunker:
         self._block_start = 0
         self._total = 0
         self._finished = False
+
+    @classmethod
+    def _from_state(
+        cls,
+        *,
+        ring: bytearray,
+        head: int,
+        filled: int,
+        fp: int,
+        payload: bytearray,
+        block_start: int,
+        total: int,
+        finished: bool,
+    ) -> "Chunker":
+        """Construct a chunker from already-validated internal state.
+
+        Used only by the boundary-context layer, which performs all format,
+        cross-field and fingerprint consistency checks before calling this.
+        The chunker takes ownership of the passed buffers; callers must hand
+        over fresh copies so later mutation of the snapshot is impossible.
+        """
+        self = cls.__new__(cls)
+        self._ring = ring
+        self._head = head
+        self._filled = filled
+        self._fp = fp
+        self._payload = payload
+        self._block_start = block_start
+        self._total = total
+        self._finished = finished
+        return self
+
+    def _snapshot_state(self) -> tuple:
+        """Return detached copies of the internal state.
+
+        Mutating the returned buffers can never affect the live chunker.
+        """
+        return (
+            bytearray(self._ring),
+            self._head,
+            self._filled,
+            self._fp,
+            bytearray(self._payload),
+            self._block_start,
+            self._total,
+            self._finished,
+        )
 
     @property
     def total_bytes(self) -> int:
