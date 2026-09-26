@@ -30,6 +30,17 @@ from .chunker import (
     split_stream,
 )
 from ._fingerprint import POLY, WINDOW_SIZE
+from .recipe import (
+    MAX_RECIPE_NEW_BYTES,
+    MAX_RECIPE_OLD_BYTES,
+    CopyInstruction,
+    LiteralInstruction,
+    Recipe,
+    RecipeError,
+    SourceBlock,
+    apply_recipe,
+    generate_recipe,
+)
 
 __all__ = [
     "Block",
@@ -38,6 +49,7 @@ __all__ = [
     "CUT_MASK",
     "Chunker",
     "ConfigurationError",
+    "CopyInstruction",
     "FINGERPRINT_BITS",
     "InputTooLargeError",
     "InvalidBatchTypeError",
@@ -48,7 +60,15 @@ __all__ = [
     "REASON_CONTENT",
     "REASON_MAX",
     "REASON_TAIL",
+    "Recipe",
+    "RecipeError",
+    "SourceBlock",
     "StreamFinishedError",
+    "MAX_RECIPE_NEW_BYTES",
+    "MAX_RECIPE_OLD_BYTES",
+    "LiteralInstruction",
+    "apply_recipe",
+    "generate_recipe",
     "WINDOW_BYTES",
     "WINDOW_SIZE",
     "split_stream",

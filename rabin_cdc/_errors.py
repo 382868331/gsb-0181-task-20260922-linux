@@ -12,6 +12,7 @@ __all__ = [
     "ConfigurationError",
     "InvalidBatchTypeError",
     "InputTooLargeError",
+    "RecipeError",
     "StreamFinishedError",
 ]
 
@@ -30,6 +31,10 @@ class InvalidBatchTypeError(CDCError, TypeError):
 
 class InputTooLargeError(CDCError, ValueError):
     """The cumulative stream would exceed :data:`MAX_TOTAL_BYTES`."""
+
+
+class RecipeError(CDCError, ValueError):
+    """A recipe input or recipe instruction is invalid."""
 
 
 class StreamFinishedError(CDCError, ValueError):

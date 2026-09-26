@@ -1,8 +1,9 @@
-# rabin_cdc — 内容定义分块（抗边界扰动切分）可复用模块
+# rabin_cdc — 内容定义分块与离线 copy/literal 配方
 
 离线数据存储场景的 content-defined chunking 题库：用 GF(2) 多项式余数（Rabin 型
 指纹）在字节流中滚动寻找切块点，使局部插入/删除只影响有限区域，后续块边界
-自动重新对齐，从而可按内容哈希复用未改动的块。
+自动重新对齐。新增长度 2048 字节内的离线配方生成器：引用旧块中的任意半开
+字节区间，或输出 literal 字节，使拼接结果与新内容逐字节相同。
 
 - **Python**：3.14.7（仅用标准库：`hashlib`、`array`、`dataclasses`）
 - **依赖**：无第三方依赖，`pip install` 不需要任何包；完全离线，不访问网络、
@@ -12,12 +13,20 @@
 ## 准确命令
 
 ```bash
-# 必要测试（含独立慢速长除法参考对拍）
+# Linux 原生 Python 3.14.7；只创建本项目目录下的标准库 venv
+python3.14 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+
+# 必要测试（原分块测试 + 新配方独立参考/枚举最优性测试）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：真实计算约 0.2 秒（远低于 8 秒预算），打印正常结果与实际触发的拒绝
-python demo.py
+# 固定输入配方演示：现场计算，通常远低于 90 秒，包含伪造摘要候选被字节比较拒绝
+python demo_iteration.py
 ```
+
+不使用第三方运行依赖；pip 命令只准备 venv，自身无需安装 requirements。
+旧的 python demo.py 仍可运行，用于查看原有分块演示。
 
 ## 算法契约（固定）
 
@@ -76,6 +85,36 @@ blocks: list[Block] = split_stream(chunks)
 常量：`MIN_BLOCK_BYTES=64`、`MAX_BLOCK_BYTES=256`、`MAX_TOTAL_BYTES=1<<20`、
 `WINDOW_BYTES=32`、`CUT_MASK=0x3F`、`POLY=0x11021`。
 
+### 离线配方
+
+```python
+from rabin_cdc import (
+    SourceBlock, LiteralInstruction, CopyInstruction,
+    generate_recipe, apply_recipe,
+)
+
+old_blocks = [b"...", SourceBlock(b"...", sha256="...")]
+recipe = generate_recipe(old_blocks, b"new bytes")
+assert apply_recipe(recipe, old_blocks) == b"new bytes"
+```
+
+- `generate_recipe(old_blocks, new_content)`：旧块可直接传 bytes-like、一个
+  `SourceBlock`，或它们的可迭代对象；允许空块。旧内容总长和新内容各不超过
+  2048 字节。
+- `SourceBlock(payload, sha256=None)`：未提供摘要时计算 SHA-256；提供的摘要
+  只建立候选索引，命中后仍必须做字节相等比较。摘要错误或刻意伪造碰撞不会
+  产生错误 copy。
+- `LiteralInstruction(data)` 追加 literal 字节；
+  `CopyInstruction(block_index, start, length)` 追加旧块的半开区间
+  `[start, start + length)`。copy 不得跨越旧块边界，但可引用任意非空部分区间。
+- `apply_recipe(recipe, old_blocks)` 独立执行配方，重新检查块下标、区间和
+  指令类型，并返回拼接字节。
+- 优化顺序固定为：literal 字节最少，其次指令数最少，最后按 copy 优先于
+  literal、copy 的 `(block_index, start, end)` 升序及后续序列确定。短串测试
+  枚举所有切分对拍该顺序。
+- 精确动态规划枚举每个可用 `(块, 起点)` 的所有可行复制终点，并用区间树选择
+  后续最优状态；不是文件同步产品，也不做磁盘块库、网络协议或压缩编码。
+
 ## 错误语义（可定位，不静默纠正）
 
 异常都派生自 `rabin_cdc.CDCError`：
@@ -90,6 +129,10 @@ blocks: list[Block] = split_stream(chunks)
   部分进入内部状态，随后可继续喂入合法批次，结果与从未提交坏批次一致。
 - 本算法核心不存在搜索/求解过程，因此没有“预算耗尽”类错误；测试中的确定性
   小范围枚举若找不到构造值会显式失败，与“证明无解”不做混淆。
+
+配方错误抛出 `RecipeError`（同时是 `ValueError`，并派生自 `CDCError`），包括：
+旧块或新内容不是 bytes-like、旧内容或新内容超过 2048 字节、
+`SourceBlock.sha256` 不是字符串、copy 下标或区间越界、配方指令类型未知。
 
 ## 浮点 / 误差口径
 
@@ -120,6 +163,13 @@ blocks: list[Block] = split_stream(chunks)
 - 单流上限 1 MiB 是接口边界；超限直接报错，不做磁盘溢出。
 - 非线程安全：一个 `Chunker` 不应被多线程并发 `add`。
 - 内容寻址的“块存储后端/去重库”不在本题范围内，demo 只展示复用比例。
+- 配方生成器明确限定旧内容总长、新内容各不超过 2048 字节；这是精确小型 DP
+  的题目边界，不扩展为大文件 rsync、补丁格式、压缩器、网络同步协议或数据库
+  支持的块存储。
+- 配方只保证当前给定旧块集合下可字节重建；不维护版本历史，也不把 SHA-256
+  摘要相同当作内容相同。测试通过伪造摘要验证“候选命中但字节不等”路径。
+- 最坏情况下旧库与新内容高度重复时纯 Python 精确 DP 可能耗时数秒；演示使用
+  小输入，在 90 秒预算内现场完成，不使用 sleep 或预录结果。
 
 ## 仓库布局
 
@@ -129,14 +179,21 @@ rabin_cdc/
   chunker.py         split_stream / Chunker / Block（滚动切分核心）
   _fingerprint.py    GF(2) 余数与三张滚动更新表
   _errors.py         异常类型
+  recipe.py          copy/literal 配方、2048 字节精确 DP 与执行器
 tests/
   _slow_reference.py 独立慢速参考：逐位长除、每位置重算窗口（不导入被测核心）
   _data.py           确定性 LCG 样例数据（无外部附件）
   test_fingerprint.py 指纹/表/滚动与长除一致性
   test_chunker.py    契约、零数据、窗口前缀、任意分批等价、插入一字节恢复、
                      错误语义、原子性、上限、fuzz 对拍
-demo.py              固定输入演示（复用块比例 + 真实拒绝边界）
+  _recipe_reference.py 独立配方解释器与所有切分枚举参考（不导入被测配方）
+  test_recipe.py     重复块、跨块片段、伪造摘要碰撞、空内容、异常路径与最优性
+demo.py              原分块固定输入演示（复用块比例 + 真实拒绝边界）
+demo_iteration.py   新配方固定输入演示（部分区间 + 摘要碰撞拒绝）
 ```
 
 独立参考 `tests/_slow_reference.py` **不导入** `rabin_cdc`，期望值全部由原始
 数学定义重新推出；“同一数据多种喂法结果一致”的往返检查仅作为补充测试。
+
+`tests/_recipe_reference.py` 也**不导入** `rabin_cdc`：它独立解释 copy/literal，
+并对短串枚举全部可行切分，验证配方不是由被测生成器自证最优。
