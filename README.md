@@ -1,22 +1,38 @@
-# rabin_cdc — 内容定义分块（抗边界扰动切分）可复用模块
+# rabin_cdc — 内容定义分块（抗边界扰动切分）+ 离线组装配方生成器
 
 离线数据存储场景的 content-defined chunking 题库：用 GF(2) 多项式余数（Rabin 型
 指纹）在字节流中滚动寻找切块点，使局部插入/删除只影响有限区域，后续块边界
 自动重新对齐，从而可按内容哈希复用未改动的块。
+
+本次增量：在分块器之上接了一个**离线配方生成器**（`rabin_cdc/recipe.py`）——
+输入旧块的字节内容和一份新内容，输出由 copy（引用旧块区间）与 literal（内嵌
+字节）组成的配方，执行配方后逐字节精确得到新内容。不是文件同步产品。
 
 - **Python**：3.14.7（仅用标准库：`hashlib`、`array`、`dataclasses`）
 - **依赖**：无第三方依赖，`pip install` 不需要任何包；完全离线，不访问网络、
   账号、密钥、数据库、中间件、云 API、Docker 或特殊硬件。
 - **平台**：Linux 原生运行。
 
+## 环境准备（venv）
+
+仓库根目录的 `.venv` 已指向一个 Python 3.14.7 虚拟环境；如需重建：
+
+```bash
+python3.14 -m venv .venv   # 或指向本机 Python 3.14.7 解释器的路径
+# 无需 pip install：仅标准库，requirements.txt 为空说明
+```
+
 ## 准确命令
 
 ```bash
-# 必要测试（含独立慢速长除法参考对拍）
+# 必要测试（分块契约 + 配方最优性/碰撞/异常路径，含独立参考对拍）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：真实计算约 0.2 秒（远低于 8 秒预算），打印正常结果与实际触发的拒绝
+# 分块演示：真实计算约 0.2 秒，打印复用比例与实际触发的拒绝
 python demo.py
+
+# 配方演示：现场生成并执行配方、逐字节核对、触发真实拒绝（远低于 90 秒）
+python demo_iteration.py
 ```
 
 ## 算法契约（固定）
@@ -76,6 +92,46 @@ blocks: list[Block] = split_stream(chunks)
 常量：`MIN_BLOCK_BYTES=64`、`MAX_BLOCK_BYTES=256`、`MAX_TOTAL_BYTES=1<<20`、
 `WINDOW_BYTES=32`、`CUT_MASK=0x3F`、`POLY=0x11021`。
 
+## 组装配方（本次增量）
+
+```python
+from rabin_cdc import build_recipe, apply_recipe, CopyChunk, LiteralChunk
+
+recipe = build_recipe(old_blocks, new_content)   # list[CopyChunk | LiteralChunk]
+rebuilt = apply_recipe(old_blocks, recipe)        # == new_content，逐字节相等
+```
+
+- `build_recipe(old_blocks, new_content)`：`old_blocks` 是 bytes-like 块的
+  list/tuple（总长 ≤ `MAX_OLD_TOTAL_BYTES = 2048`），`new_content` 是
+  bytes-like（≤ `MAX_NEW_BYTES = 2048`）。返回配方 op 列表；空新内容返回
+  `[]`。`CopyChunk(block, start, length)` 引用
+  `old_blocks[block][start:start+length]`（**允许部分区间**）；
+  `LiteralChunk(data)` 内嵌字节。
+- `apply_recipe(old_blocks, recipe)`：独立执行配方并逐字段校验，返回拼装
+  结果；op 类型/区间非法时拒绝，不静默纠正。
+- `recipe_cost(recipe)`：返回 `(literal 字节数, op 数)`，仅用于展示。
+
+### 最优性契约（精确动态规划）
+
+目标按字典序依次优化：
+
+1. **literal 字节数最少**；
+2. **指令（op）数最少**；
+3. **确定的引用顺序**：同一输出位置上 copy 优先于 literal；copy 之间按
+   `(block, start, length)` 排序；literal 之间按长度排序。DP 按这些键
+   对整条剩余 op 序列做字典序比较，因此结果完全确定、可复现。
+
+因为任何长度 ≥1 的 copy 都减少 literal 字节，精确解必须考虑 1 字节匹配；
+实现用后缀 DP（`cost[i] = new[i:]` 的最优 `(literal, ops)`）在
+`O(n·(n + 匹配长))` 内给出精确解，2048 字节上限下为亚秒级。
+
+### 摘要只找候选，字节说了算
+
+候选旧位置用 1 字节种子的摘要（默认 SHA-256）分桶查找；**每个候选命中后
+必须逐字节比较**真实内容才会进入配方。摘要碰撞（测试里用常量摘要函数刻意
+注入）只会拖慢搜索，绝不会让不同字节被当作相同。种长取 1 是为了不漏掉
+任何可行 copy，保证精确最优而非启发式。
+
 ## 错误语义（可定位，不静默纠正）
 
 异常都派生自 `rabin_cdc.CDCError`：
@@ -90,6 +146,15 @@ blocks: list[Block] = split_stream(chunks)
   部分进入内部状态，随后可继续喂入合法批次，结果与从未提交坏批次一致。
 - 本算法核心不存在搜索/求解过程，因此没有“预算耗尽”类错误；测试中的确定性
   小范围枚举若找不到构造值会显式失败，与“证明无解”不做混淆。
+- 配方生成/执行新增（同属 `CDCError` 族）：
+  - `InvalidRecipeInputError`（同时是 `TypeError`）：`old_blocks` 不是
+    list/tuple、直接传入单个 bytes、块/新内容不是 bytes-like、op 类型未知、
+    `CopyChunk` 字段不是 int（`bool` 同样拒绝）。
+  - `RecipeTooLargeError`（同时是 `ValueError`）：旧块总长 > 2048、新
+    内容 > 2048、或执行配方拼装输出 > 2048。
+  - `RecipeExecutionError`（同时是 `ValueError`）：copy op 引用了块外
+    区间（块号越界、start/length 越界、空 copy）。
+  - 所有校验在搜索开始前完成，非法输入不会留下半成品配方。
 
 ## 浮点 / 误差口径
 
@@ -120,6 +185,12 @@ blocks: list[Block] = split_stream(chunks)
 - 单流上限 1 MiB 是接口边界；超限直接报错，不做磁盘溢出。
 - 非线程安全：一个 `Chunker` 不应被多线程并发 `add`。
 - 内容寻址的“块存储后端/去重库”不在本题范围内，demo 只展示复用比例。
+- 配方生成器是**离线、单次**的精确求解：旧块总长与新内容各限 2048 字节，
+  超限直接报错；不做滚动文件同步、不做增量流式更新、不持久化配方。
+- 配方 DP 的最坏复杂度为 `O(n·(n+匹配总长))`：2048 上限内典型输入亚秒，
+  但刻意构造的全相同字节输入会接近最坏情况（数秒级），这是精确解的代价，
+  不用启发式近似来掩盖。
+- 摘要仅用于候选分桶；正确性不依赖任何摘要的无碰撞性。
 
 ## 仓库布局
 
@@ -128,15 +199,22 @@ rabin_cdc/
   __init__.py        公开接口导出
   chunker.py         split_stream / Chunker / Block（滚动切分核心）
   _fingerprint.py    GF(2) 余数与三张滚动更新表
+  recipe.py          build_recipe / apply_recipe / CopyChunk / LiteralChunk
   _errors.py         异常类型
 tests/
   _slow_reference.py 独立慢速参考：逐位长除、每位置重算窗口（不导入被测核心）
+  _recipe_reference.py 独立配方参考：解释器 + 暴力最优 + 全枚举（不导入被测核心）
   _data.py           确定性 LCG 样例数据（无外部附件）
   test_fingerprint.py 指纹/表/滚动与长除一致性
   test_chunker.py    契约、零数据、窗口前缀、任意分批等价、插入一字节恢复、
                      错误语义、原子性、上限、fuzz 对拍
+  test_recipe.py     配方：重复块、跨块相同片段、注入摘要碰撞、空内容、
+                     短串全枚举最优性、异常路径、分块器集成、随机对拍
 demo.py              固定输入演示（复用块比例 + 真实拒绝边界）
+demo_iteration.py    配方演示（现场生成/执行/逐字节核对 + 真实拒绝边界）
 ```
 
 独立参考 `tests/_slow_reference.py` **不导入** `rabin_cdc`，期望值全部由原始
 数学定义重新推出；“同一数据多种喂法结果一致”的往返检查仅作为补充测试。
+配方侧同理：`tests/_recipe_reference.py` 独立解释配方并核对字节、用暴力 DP
+与短串全枚举验证最优性，均不经过被测实现。
