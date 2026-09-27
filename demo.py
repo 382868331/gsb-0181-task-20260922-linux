@@ -133,7 +133,98 @@ def main() -> int:
     elapsed = time.perf_counter() - started
     print("-" * 72)
     print(f"真实计算耗时: {elapsed:.3f}s (无 sleep, 无预录结果)")
+    rebuild_demo()
     return 0
+
+
+
+
+def rebuild_demo() -> None:
+    """Multi-source rebuild planning: cost-aware source choice, missing
+    source re-plan, and a real content-mismatch rejection."""
+    from rabin_cdc import (
+        ContentMismatchError,
+        MissingSourceError,
+        Source,
+        plan_rebuild,
+        rebuild,
+    )
+
+    old_a = lcg_bytes(40_000, SEED + 1)
+    old_b = lcg_bytes(40_000, SEED + 2)
+    old_c = lcg_bytes(40_000, SEED + 3)
+    target = (
+        old_a[5_000:15_000]
+        + old_b[10_000:18_000]
+        + b"\x00" * 1_000
+        + old_c[20_000:36_000]
+        + old_a[30_000:38_000]
+    )
+
+    print("=" * 72)
+    print("多来源重建计划 (cost-aware multi-source rebuild)")
+    print("=" * 72)
+    sources = [
+        Source("local-cache", old_a, open_cost=1, byte_cost=0),
+        Source("nearby-node", old_b, open_cost=5, byte_cost=1),
+        Source("cold-archive", old_c, open_cost=50, byte_cost=2),
+        # Same content as local-cache but ruinously expensive: the planner
+        # must pick local-cache for those shared blocks.
+        Source("tape-vault", old_a, open_cost=100_000, byte_cost=0),
+        # Only overlaps the 1000 zero bytes; opening it costs more than the
+        # saving, so it must stay unused.
+        Source("zero-farm", b"\x00" * 4_096, open_cost=50_000,
+               byte_cost=0),
+    ]
+    plan = plan_rebuild(target, sources, literal_byte_cost=10)
+    print(f"目标大小            : {plan.target_size} bytes")
+    print(f"计划条目            : {len(plan.entries)} "
+          f"(reuse={sum(1 for e in plan.entries if e.kind == 'reuse')}, "
+          f"literal={sum(1 for e in plan.entries if e.kind == 'literal')})")
+    print(f"复用 / 新增字节     : {plan.reused_bytes} / {plan.literal_bytes}")
+    print(f"选用来源            : {list(plan.sources_used)}")
+    print(f"估计读取代价        : {plan.estimated_cost}")
+    for entry in plan.entries[:4]:
+        if entry.kind == "reuse":
+            print(f"  [{entry.start:>6},{entry.end:>6}) <- "
+                  f"{entry.source}@{entry.source_offset}")
+        else:
+            print(f"  [{entry.start:>6},{entry.end:>6}) <- 新数据 (literal)")
+
+    store = {s.name: s.data for s in sources}
+    result = rebuild(plan, store.get)
+    assert result.data == target
+    print(f"重建校验            : OK, 实际来源 {list(result.sources_used)}, "
+          f"复用 {result.reused_bytes} B, 新增 {result.literal_bytes} B")
+
+    # --- Missing source -> re-plan without it ----------------------------
+    print("-" * 72)
+    def missing_reader(name):
+        if name == plan.sources_used[-1]:
+            return None
+        return store.get(name)
+    try:
+        rebuild(plan, missing_reader)
+    except MissingSourceError as exc:
+        print(f"  [OK] 来源缺失 -> {exc}")
+        remaining = [s for s in sources if s.name != exc.source]
+        replanned = plan_rebuild(target, remaining, literal_byte_cost=10)
+        result2 = rebuild(replanned, lambda n: store.get(n))
+        assert result2.data == target
+        print(f"  [OK] 重新规划(去掉 {exc.source}): 复用 "
+              f"{result2.reused_bytes} B, 新增 {result2.literal_bytes} B, "
+              f"来源 {list(result2.sources_used)}")
+
+    # --- Corrupted material is rejected -----------------------------------
+    victim = plan.sources_used[0]
+    bad = bytearray(store[victim])
+    first = next(e for e in plan.entries
+                 if e.kind == "reuse" and e.source == victim)
+    bad[first.source_offset] ^= 0xFF
+    try:
+        rebuild(plan, lambda n: bytes(bad) if n == victim else store.get(n))
+    except ContentMismatchError as exc:
+        print(f"  [OK] 块内容不符被拒 -> ContentMismatchError: {exc}")
 
 
 if __name__ == "__main__":

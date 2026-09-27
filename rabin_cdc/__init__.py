@@ -53,3 +53,31 @@ __all__ = [
     "WINDOW_SIZE",
     "split_stream",
 ]
+
+from .reconstruct import (
+    ContentMismatchError,
+    InvalidSourceError,
+    MissingSourceError,
+    PlanEntry,
+    RebuildError,
+    RebuildPlan,
+    RebuildResult,
+    Source,
+    TargetMismatchError,
+    plan_rebuild,
+    rebuild,
+)
+
+__all__ += [
+    "ContentMismatchError",
+    "InvalidSourceError",
+    "MissingSourceError",
+    "PlanEntry",
+    "RebuildError",
+    "RebuildPlan",
+    "RebuildResult",
+    "Source",
+    "TargetMismatchError",
+    "plan_rebuild",
+    "rebuild",
+]

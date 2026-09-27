@@ -76,6 +76,40 @@ blocks: list[Block] = split_stream(chunks)
 常量：`MIN_BLOCK_BYTES=64`、`MAX_BLOCK_BYTES=256`、`MAX_TOTAL_BYTES=1<<20`、
 `WINDOW_BYTES=32`、`CUT_MASK=0x3F`、`POLY=0x11021`。
 
+### 多来源重建计划（reconstruct）
+
+新内容可以同时复用多份旧内容中的数据块：
+
+```python
+from rabin_cdc import Source, plan_rebuild, rebuild
+
+plan = plan_rebuild(target_bytes, sources, literal_byte_cost=1)
+result = rebuild(plan, reader)   # reader(name) -> bytes | None
+```
+
+- `Source(name, data, open_cost=1, byte_cost=0)`：一份旧内容。`open_cost`
+  是“只要从该来源读了任意块就付一次”的固定代价，`byte_cost` 是每复用
+  字节的读取代价；两者必须是非负 `int`（`bool`、float 含 NaN/Infinity
+  一律拒绝）。`literal_byte_cost`（正整数）是引入新数据的每字节代价，
+  只有读取更便宜时才会复用。
+- `plan_rebuild(target, sources, literal_byte_cost=1) -> RebuildPlan`：
+  对目标分块后，为每个可复用块**明确选定一个来源**（`PlanEntry.source`
+  / `source_offset`），找不到的块作为 `literal` 内联新数据。来源选择
+  最小化 `Σ open_cost(已用来源) + Σ byte_cost×复用字节 + literal_byte_cost
+  ×新增字节`，用确定性的贪心开源 + 单源移除启发式（同代价取小下标，
+  结果稳定）；因此“只为少量数据去读高代价来源”会被避免。这是有文档
+  说明的启发式，不承诺数学最优。
+- 来源缺失时把该 `Source` 从列表去掉再调 `plan_rebuild` 即可重新规划。
+- `rebuild(plan, reader) -> RebuildResult`：逐条执行计划。`reader` 返回
+  `None` 表示来源缺失（`MissingSourceError`，带 `.source`）；每段复用
+  切片都重新算 SHA-256 与计划引用比对，不符即 `ContentMismatchError`
+  拒绝；最终字节串再对 `target_sha256` 总校验（`TargetMismatchError`）。
+  结果记录 `reused_bytes`（复用数据量）、`literal_bytes`（新增数据量）、
+  `sources_used`（实际来源）及块数统计。
+- 这些异常的基类 `RebuildError` 同样派生自 `CDCError`；`InvalidSourceError`
+  兼为 `TypeError`。
+
+
 ## 错误语义（可定位，不静默纠正）
 
 异常都派生自 `rabin_cdc.CDCError`：
@@ -119,7 +153,10 @@ blocks: list[Block] = split_stream(chunks)
   rsync、FastCDC 等），也不提供其参数集。
 - 单流上限 1 MiB 是接口边界；超限直接报错，不做磁盘溢出。
 - 非线程安全：一个 `Chunker` 不应被多线程并发 `add`。
-- 内容寻址的“块存储后端/去重库”不在本题范围内，demo 只展示复用比例。
+- 内容寻址的“块存储后端/去重库”不在本题范围内；`reconstruct` 只做
+  内存中的计划与校验执行，来源数据由调用方 `reader` 提供。
+- 来源选择是贪心 + 局部移除的启发式，不保证全局最小代价；来源数与块数
+  很大时不做性能承诺。
 
 ## 仓库布局
 
@@ -127,6 +164,7 @@ blocks: list[Block] = split_stream(chunks)
 rabin_cdc/
   __init__.py        公开接口导出
   chunker.py         split_stream / Chunker / Block（滚动切分核心）
+  reconstruct.py     多来源重建计划：代价感知选源、重规划、逐块校验
   _fingerprint.py    GF(2) 余数与三张滚动更新表
   _errors.py         异常类型
 tests/
@@ -135,7 +173,9 @@ tests/
   test_fingerprint.py 指纹/表/滚动与长除一致性
   test_chunker.py    契约、零数据、窗口前缀、任意分批等价、插入一字节恢复、
                      错误语义、原子性、上限、fuzz 对拍
-demo.py              固定输入演示（复用块比例 + 真实拒绝边界）
+  test_reconstruct.py 多来源计划：选源代价、共享块选廉价源、贵源回避、
+                     缺失重规划、重建校验与拒绝语义
+demo.py              固定输入演示（复用块比例 + 多来源重建计划 + 真实拒绝边界）
 ```
 
 独立参考 `tests/_slow_reference.py` **不导入** `rabin_cdc`，期望值全部由原始
