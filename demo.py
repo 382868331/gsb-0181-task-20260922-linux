@@ -23,8 +23,12 @@ import time
 from rabin_cdc import (
     MAX_TOTAL_BYTES,
     Block,
+    BlockVerificationError,
     InputTooLargeError,
     InvalidBatchTypeError,
+    Source,
+    execute_plan,
+    plan_reconstruction,
     split_stream,
 )
 
@@ -129,6 +133,61 @@ def main() -> int:
         split_stream(["not-a-bytes-batch"])
     except InvalidBatchTypeError as exc:
         print(f"  [OK] 非法批次类型 -> {type(exc).__name__}: {exc}")
+
+    # --- Multi-source reconstruction plan -------------------------------
+    print("-" * 72)
+    print("跨来源重建计划 (不同读取代价的来源之间选择复用块)")
+    # Two old archives hold the original stream's blocks; the edited stream
+    # is the reconstruction target.
+    orig_store = {b.sha256: data[b.start:b.end] for b in original}
+    old_half = len(original) // 2
+    src_local = Source(
+        "local-cache", fixed_cost=1, byte_cost=0,
+        hashes={b.sha256 for b in original[:old_half]},
+    )
+    src_remote = Source(
+        "remote-archive", fixed_cost=50, byte_cost=2,
+        hashes={b.sha256 for b in original[old_half:]},
+    )
+    plan = plan_reconstruction([*edited], [src_local, src_remote],
+                               new_byte_cost=4)
+    print(f"  目标块数 / 总字节 : {len(edited)} / {len(modified)}")
+    print(f"  计划总代价        : {plan.total_cost}")
+    print(f"  计划复用 / 新增   : {plan.reused_bytes} / {plan.new_bytes} bytes")
+    print(f"  计划读取来源      : {plan.sources_used}")
+    for step in plan.steps[:3]:
+        print(f"    示例步骤: [{step.block.start},{step.block.end}) "
+              f"kind={step.kind} source={step.source}")
+
+    # A source goes offline -> re-plan without it.
+    replanned = plan.replan(["remote-archive"])
+    print(f"  remote 下线后重规划: 复用 {replanned.reused_bytes} / "
+          f"新增 {replanned.new_bytes} bytes, 来源 {replanned.sources_used}")
+
+    # Execute the original plan: every payload is hash-verified.
+    readers = {"local-cache": lambda h: orig_store[h],
+               "remote-archive": lambda h: orig_store[h]}
+    new_payloads = {
+        step.block.sha256: modified[step.block.start:step.block.end]
+        for step in plan.steps
+        if step.kind == "new"
+    }
+    report = execute_plan(plan, readers, new_payloads)
+    ok = report.data == modified
+    print(f"  重建结果与目标一致: {ok}  (sha256={report.sha256[:16]}...)")
+    print(f"  实际复用 / 新增   : {report.reused_bytes} / "
+          f"{report.new_bytes} bytes, 实际来源 {report.sources_used}")
+
+    # Corrupted material from a source must be rejected.
+    def corrupt_reader(digest):
+        good = orig_store[digest]
+        return good[:-1] + bytes([good[-1] ^ 0xFF])
+
+    try:
+        execute_plan(plan, {"local-cache": corrupt_reader,
+                            "remote-archive": corrupt_reader}, new_payloads)
+    except BlockVerificationError as exc:
+        print(f"  [OK] 篡改材料被拒 -> {type(exc).__name__}: {exc}")
 
     elapsed = time.perf_counter() - started
     print("-" * 72)

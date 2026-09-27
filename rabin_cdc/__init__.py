@@ -14,6 +14,17 @@ from ._errors import (
     InvalidBatchTypeError,
     StreamFinishedError,
 )
+from .reconstruct import (
+    KIND_NEW,
+    KIND_REUSE,
+    MAX_SOURCES,
+    Plan,
+    PlanStep,
+    ReconstructionReport,
+    Source,
+    execute_plan,
+    plan_reconstruction,
+)
 from .chunker import (
     CUT_MASK,
     FINGERPRINT_BITS,
@@ -30,9 +41,21 @@ from .chunker import (
     split_stream,
 )
 from ._fingerprint import POLY, WINDOW_SIZE
+from ._errors import BlockVerificationError, MissingBlockDataError
 
 __all__ = [
     "Block",
+    "BlockVerificationError",
+    "KIND_NEW",
+    "KIND_REUSE",
+    "MAX_SOURCES",
+    "MissingBlockDataError",
+    "Plan",
+    "PlanStep",
+    "ReconstructionReport",
+    "Source",
+    "execute_plan",
+    "plan_reconstruction",
     "BytesLike",
     "CDCError",
     "CUT_MASK",

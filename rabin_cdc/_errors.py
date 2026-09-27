@@ -9,9 +9,11 @@ from __future__ import annotations
 
 __all__ = [
     "CDCError",
+    "BlockVerificationError",
     "ConfigurationError",
     "InvalidBatchTypeError",
     "InputTooLargeError",
+    "MissingBlockDataError",
     "StreamFinishedError",
 ]
 
@@ -34,3 +36,13 @@ class InputTooLargeError(CDCError, ValueError):
 
 class StreamFinishedError(CDCError, ValueError):
     """The stream was used after ``finish()`` ended it."""
+
+
+class MissingBlockDataError(CDCError, ValueError):
+    """Reconstruction needs a source reader or new-block payload that was
+    not supplied."""
+
+
+class BlockVerificationError(CDCError, ValueError):
+    """Material fetched during reconstruction does not match the hash or
+    size the plan refers to and must be rejected."""

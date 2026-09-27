@@ -76,6 +76,17 @@ blocks: list[Block] = split_stream(chunks)
 常量：`MIN_BLOCK_BYTES=64`、`MAX_BLOCK_BYTES=256`、`MAX_TOTAL_BYTES=1<<20`、
 `WINDOW_BYTES=32`、`CUT_MASK=0x3F`、`POLY=0x11021`。
 
+## 多来源重建计划（reconstruct 模块）
+
+新内容可以同时复用多份旧内容中的块。plan_reconstruction(blocks, sources, *, new_byte_cost=1) 为目标的每个 Block 在可用来源间做精确代价最优选择：
+
+- Source(name, fixed_cost, byte_cost, hashes)：一个旧档案。读取它需支付一次 fixed_cost，再按复用字节数支付 byte_cost；hashes 是它持有的块 SHA-256 集合。代价必须是非负有限数（拒绝 bool / NaN / Infinity）。
+- 计划最小化「已用来源固定代价之和 + 每块最便宜所选来源的字节代价 + 新增字节数 × new_byte_cost」，在全部来源子集上精确枚举（来源数上限 MAX_SOURCES = 20）。这样就不会为少量数据去读取固定代价很高的来源。
+- 同一块出现在多个来源时，PlanStep.source 明确记录选中的是哪一处；找不到来源的块标记为 kind="new"。
+- plan.replan(unavailable)：来源缺失（下线）时在剩余来源上重新规划；未知名称抛 ConfigurationError。
+- execute_plan(plan, readers, new_data)：按计划取料重建。readers 把来源名映射到「按 SHA-256 取块」的回调，new_data 提供新增块载荷。每份材料都核对长度与 SHA-256，不符合引用的材料抛 BlockVerificationError 拒绝；缺 reader / 缺新增载荷抛 MissingBlockDataError。
+- 返回 ReconstructionReport：重建字节与目标逐块核对后拼接，并记录 reused_bytes、new_bytes、实际读取的 sources_used、块数与整体 SHA-256。
+
 ## 错误语义（可定位，不静默纠正）
 
 异常都派生自 `rabin_cdc.CDCError`：
@@ -86,6 +97,8 @@ blocks: list[Block] = split_stream(chunks)
   （含 NaN/±Infinity）一律拒绝而非隐式转换。
 - `InputTooLargeError`（同时是 `ValueError`）：累计输入会超过 1 MiB。
 - `StreamFinishedError`：`finish()` 后再 `add()`/`finish()`。
+- MissingBlockDataError（同时是 ValueError）：重建时缺少来源 reader 或新增块载荷。
+- BlockVerificationError（同时是 ValueError）：取回的材料长度或 SHA-256 与计划引用不符，必须拒绝。
 - **有状态操作原子性**：类型与上限检查在消费任何字节之前完成；被拒批次不会
   部分进入内部状态，随后可继续喂入合法批次，结果与从未提交坏批次一致。
 - 本算法核心不存在搜索/求解过程，因此没有“预算耗尽”类错误；测试中的确定性
@@ -127,6 +140,7 @@ blocks: list[Block] = split_stream(chunks)
 rabin_cdc/
   __init__.py        公开接口导出
   chunker.py         split_stream / Chunker / Block（滚动切分核心）
+  reconstruct.py     多来源重建计划 / 执行与校验
   _fingerprint.py    GF(2) 余数与三张滚动更新表
   _errors.py         异常类型
 tests/
@@ -135,6 +149,8 @@ tests/
   test_fingerprint.py 指纹/表/滚动与长除一致性
   test_chunker.py    契约、零数据、窗口前缀、任意分批等价、插入一字节恢复、
                      错误语义、原子性、上限、fuzz 对拍
+  test_reconstruct.py 多来源规划代价最优、来源选择记录、重规划、
+                     重建校验与拒绝、统计字段
 demo.py              固定输入演示（复用块比例 + 真实拒绝边界）
 ```
 
